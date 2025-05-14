@@ -1,119 +1,202 @@
+#!/usr/bin/env python3
 import serial
 import time
 import json
+import math
 from datetime import datetime
-from serial.tools import list_ports
 import paho.mqtt.client as mqtt
+import sys
+import re
 
-# MQTT configuration
-MQTT_BROKER = "192.168.1.6"
-MQTT_TOPIC = "homeassistant/energy/Vkingner"
+# —— MQTT settings —— #
+MQTT_BROKER    = "192.168.1.6"
+MQTT_TOPIC     = "homeassistant/energy/Vkingner"
 
-# Serial port scan settings
-def list_usb_ports():
-    return [port.device for port in list_ports.comports() if port.device.startswith('/dev/ttyUSB')]
-BAUDRATE = 115200
-TIMEOUT = 1  # seconden
-INTERVAL = 2  # seconden tussen metingen
+# —— Serial port settings —— #
+SERIAL_PORT    = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+BAUDRATE       = 115200
+TIMEOUT        = 1    # seconds timeout per read
+INTERVAL       = 2    # seconds between measurements
 
-# Offset definitions
-OFFSET_VOLTAGE = 7    # 2 bytes, u16, /100 -> Volt
-OFFSET_CURRENT = 11   # 2 bytes, i16, /100 -> Ampère
-OFFSET_SOC = 15       # 1 byte, raw SOC %
+# —— BMS commands for cell voltages & temperature —— #
+CMD_CELLS_1_8   = "61014642E00201FD30"  # page for cells 1–8
+CMD_CELLS_9_16  = "610146F2E00201FD32"  # page for cells 9–16
+CMD_TEMP        = "6101464FE00201FD1C"  # temperature page
+TERM            = b"\r"              # terminator
 
-# Command to request full BMS values (voltage, current, SOC)
-BMS_CMD = bytes.fromhex("7E3631303134364237453030323031464431440D")
+# —— BMS summary command (V/I/SOC/SOH/StoredAh/FullAh) —— #
+# full frame bytes including '~' and CR
+CMD_SUMMARY    = bytes.fromhex('7E3631303134364237453030323031464431440D')
+OFF_VOLTAGE    = 7    # unsigned 16-bit /100 -> volts
+OFF_CURRENT    = 11   # signed 16-bit /100 -> amps
+OFF_SOC        = 15   # unsigned 8-bit -> % state of charge
+OFF_STORED_AH  = 18   # unsigned 16-bit /100 -> Ah stored capacity
+OFF_FULL_AH    = 22   # unsigned 16-bit /100 -> Ah full capacity
 
+# —— NTC temperature parsing settings —— #
+HEX_GROUP_RE    = re.compile(r'([0-9A-Fa-f]{4})')
+HEADER_GROUPS   = 2   # skip header hex groups
+CRC_GROUPS      = 1   # skip CRC hex groups
+PAIR_INDICES    = [0,2,3,5,6,7]
+SENSOR_NAMES    = [
+    'cell_temp_1','cell_temp_2','cell_temp_3','cell_temp_4',
+    'env_temp','mos_temp'
+]
+R0              = 10000.0
+T0              = 25.0 + 273.15
+B_COEFF         = 3950.0
+CALIBRATION     = {
+    'cell_temp_1': -2.38,
+    'cell_temp_2': 10.71,
+    'cell_temp_3': -2.32,
+    'cell_temp_4': 7.64,
+    'env_temp':     9.07,
+    'mos_temp':     8.86,
+}
 
-def read_bms_response(ser):
-    """
-    Send the BMS command and read raw response bytes.
-    """
-    ser.write(BMS_CMD)
-    time.sleep(0.1)
-    raw = ser.read(512)
-    if not raw:
-        return None
+# —— BMS status flags page (0x50) —— #
+CMD_STATUS      = "61014650E00201FD1F"
+MASK_WARNING    = 0x01  # Warning state
+MASK_PROTECT    = 0x02  # Protect state
+MASK_BALANCE    = 0x04  # Balance state
+MASK_HW_ERROR   = 0x08  # Hardware error
+
+# —— Utility functions —— #
+def open_serial(port, baud, timeout):
     try:
-        resp_str = raw.decode(errors='ignore').strip('~\r\n')
-        data = bytes.fromhex(resp_str)
-    except Exception:
-        data = raw
-    return data
+        ser = serial.Serial(port, baud, timeout=timeout)
+        ser.dtr = False
+        ser.rts = False
+        ser.reset_input_buffer()
+        return ser
+    except Exception as e:
+        print(f"[ERROR] Cannot open serial port: {e}")
+        sys.exit(1)
 
 
-def parse_bms_data(data):
+def send_cmd(ser, cmd):
     """
-    Parse voltage, current, and SOC from raw data bytes.
+    Send a command to the BMS. `cmd` can be a hex string (no framing) or full bytes frame.
     """
-    def u16(offset):
-        return int.from_bytes(data[offset:offset+2], byteorder='big')
-
-    def i16(offset):
-        return int.from_bytes(data[offset:offset+2], byteorder='big', signed=True)
-
-    voltage = u16(OFFSET_VOLTAGE) / 100.0
-    current = i16(OFFSET_CURRENT) / 100.0
-    soc_raw = data[OFFSET_SOC]
-    return voltage, current, soc_raw
+    if isinstance(cmd, bytes):
+        frame = cmd
+    else:
+        frame = b'~' + cmd.encode('ascii') + TERM
+    ser.reset_input_buffer()
+    ser.write(frame)
+    time.sleep(0.05)
+    return ser.read_until(TERM)
 
 
-def find_and_open_port():
-    """
-    Scan candidate USB ports and return an open Serial object.
-    """
-    for port in list_usb_ports():
-        try:
-            ser = serial.Serial(port, BAUDRATE, timeout=TIMEOUT)
-            ser.setRTS(True)
-            ser.setDTR(False)
-            # Test by sending one command
-            if read_bms_response(ser):
-                return ser
-            ser.close()
-        except (serial.SerialException, OSError):
-            continue
-    return None
+def parse_ascii_hex_frame(raw):
+    payload = raw.strip().lstrip(b'~').rstrip(TERM)
+    try:
+        return bytes.fromhex(payload.decode('ascii'))
+    except:
+        return b''
 
 
-def main():
-    print("BMS uitlezing gestart...")
+def extract_cell_voltages(data, start_index):
+    vals = {}
+    offset = 8
+    count = (len(data) - offset) // 2
+    for i in range(count):
+        idx = start_index + i
+        if 1 <= idx <= 16:
+            raw = int.from_bytes(data[offset+2*i:offset+2*i+2], 'big')
+            vals[f'cell_{idx}'] = raw
+    return vals
 
-    # Set up MQTT connection
+
+def parse_resistances(ascii_frame):
+    text = ascii_frame.strip().lstrip('~').rstrip('\r')
+    groups = HEX_GROUP_RE.findall(text)
+    if len(groups) < HEADER_GROUPS + 8 + CRC_GROUPS:
+        return []
+    payload = groups[HEADER_GROUPS : HEADER_GROUPS+8]
+    try:
+        return [int(payload[i], 16) for i in PAIR_INDICES]
+    except:
+        return []
+
+
+def resistance_to_celsius(R):
+    if R is None or R <= 0:
+        return None
+    inv_T = 1.0/T0 + (1.0/B_COEFF)*math.log(R/R0)
+    kelvin = 1.0 / inv_T
+    return kelvin - 273.15
+
+
+def read_summary(ser):
+    raw = send_cmd(ser, CMD_SUMMARY)
+    if not raw.startswith(b'~'):
+        return {}
+    line = raw.decode('ascii', errors='ignore').strip()
+    hex_str = line.lstrip('~').rstrip('\r')
+    try:
+        data = bytes.fromhex(hex_str)
+    except:
+        return {}
+    return {
+        'voltage': round(int.from_bytes(data[OFF_VOLTAGE:OFF_VOLTAGE+2],'big')/100.0,2),
+        'current': round(int.from_bytes(data[OFF_CURRENT:OFF_CURRENT+2],'big',signed=True)/100.0,2),
+        'soc': data[OFF_SOC],
+        'soh': 100,
+        'stored_ah': round(int.from_bytes(data[OFF_STORED_AH:OFF_STORED_AH+2],'big')/100.0,2),
+        'full_ah': round(int.from_bytes(data[OFF_FULL_AH:OFF_FULL_AH+2],'big')/100.0,2)
+    }
+
+# —— Main program —— #
+if __name__ == '__main__':
+    ser = open_serial(SERIAL_PORT, BAUDRATE, TIMEOUT)
     client = mqtt.Client()
-    client.connect(MQTT_BROKER)
+    client.on_connect = lambda c,u,f,rc: print(f"[MQTT] Connected rc={rc}")
+    client.connect(MQTT_BROKER,1883,60)
     client.loop_start()
-
-    ser = find_and_open_port()
-    if not ser:
-        print("Geen werkende /dev/ttyUSB-poort gevonden.")
-        client.loop_stop()
-        client.disconnect()
-        return
-
+    print("Starting BMS readout (metrics, status, cells, temp)…")
     try:
         while True:
-            data = read_bms_response(ser)
-            ts = datetime.now().strftime("%H:%M:%S")
-            if data and len(data) > OFFSET_SOC:
-                voltage, current, soc = parse_bms_data(data)
-                payload = json.dumps({
-                    "voltage": round(voltage, 2),
-                    "current": round(current, 2),
-                    "soc": soc
-                })
-                client.publish(MQTT_TOPIC, payload)
-                print(f"[{ts}] Voltage: {voltage:.2f} V | Stroom: {current:.2f} A | SOC: {soc}%")
-            else:
-                print(f"[{ts}] Geen data of onvolledige respons ontvangen.")
+            ts = datetime.now().isoformat()
+            summary = read_summary(ser)
+            # status flags
+            raw_status = send_cmd(ser, CMD_STATUS)
+            status_data = parse_ascii_hex_frame(raw_status)
+            flags = status_data[4] if len(status_data)>=5 else 0
+            warning = bool(flags & MASK_WARNING)
+            protect = bool(flags & MASK_PROTECT)
+            balance = bool(flags & MASK_BALANCE)
+            hw_error = bool(flags & MASK_HW_ERROR)
+            # cell voltages
+            d1 = parse_ascii_hex_frame(send_cmd(ser, CMD_CELLS_1_8))
+            d2 = parse_ascii_hex_frame(send_cmd(ser, CMD_CELLS_9_16))
+            cells = {**extract_cell_voltages(d1,1), **extract_cell_voltages(d2,9)}
+            # temperatures
+            rawt = send_cmd(ser, CMD_TEMP)
+            resistances = parse_resistances(rawt.decode('ascii',errors='ignore'))
+            temps = {}
+            if len(resistances)==len(SENSOR_NAMES):
+                for name,R in zip(SENSOR_NAMES,resistances):
+                    t = resistance_to_celsius(R)
+                    if t is not None:
+                        temps[name] = round(t+CALIBRATION[name],2)
+            # assemble payload
+            payload = {'timestamp': ts}
+            payload.update(summary)
+            payload.update({
+                'warning_state': warning,
+                'protect_state': protect,
+                'balance_state': balance,
+                'hardware_error': hw_error
+            })
+            payload.update(cells)
+            payload.update(temps)
+            client.publish(MQTT_TOPIC,json.dumps(payload))
+            print(f"{ts} | {payload}")
             time.sleep(INTERVAL)
     except KeyboardInterrupt:
-        print("Uitlezing gestopt via CTRL+C.")
+        print("Stopped by user")
     finally:
         ser.close()
         client.loop_stop()
         client.disconnect()
-
-
-if __name__ == '__main__':
-    main()
